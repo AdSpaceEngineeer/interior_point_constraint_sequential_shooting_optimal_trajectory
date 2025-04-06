@@ -1,0 +1,452 @@
+# This code uses shooting method to optimize trajectory with an interior point constraint using sequencing shooting method
+
+# import libraries
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import fsolve
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+# Constants given
+a = 42165.0  # GEO orbit radius (km)
+mu = 398600.0  # Earth's gravitational parameter (km³/s²)
+n = np.sqrt(mu / a**3)  # Mean motion (rad/s)
+T = 0.0015 / 1000.0  # Thrust in kN (1.5 mN)
+Isp = 4190.0         # Specific impulse (s)
+g0 = 9.8 / 1000.0    # km/s²
+c = Isp * g0         # Exhaust velocity (km/s)
+t0 = 0.0            # Initial time = 0 s
+tf = 200 * 60.0  # Final time = 12000 s
+
+# Boundary conditions given
+r0 = [0.0, 0.2, 0.0]       # Initial relative position (km)
+v0 = [0.0, 0.0, 0.0]       # Initial relative velocity (km/s)
+m0 = 50.0                  # Initial mass (kg)
+rf = [0.0, -0.2, 0.0]      # Final relative position (km)
+vf = [0.0, 0.0, 0.0]       # Final relative velocity (km/s)
+r_wp = [0.05, 0.0, 0.05]   # Interior Waypoint position (km)
+# v_wp = free
+# t_wp is free
+
+#custom functions for control, switching, throttle, Hamiltonian, State-Costate Propagation, Sequential Shooting, Continuation function, 
+
+# control function
+def control_function_u(lambda_v):
+    lambda_v_x, lambda_v_y, lambda_v_z = lambda_v
+    norm_lambda_v = np.linalg.norm(lambda_v)
+    # recourse for division by zero
+    if norm_lambda_v < 1e-12:
+        norm_lambda_v = 1e-12
+    u_x = -lambda_v_x / norm_lambda_v
+    u_y = -lambda_v_y / norm_lambda_v
+    u_z = -lambda_v_z / norm_lambda_v
+    u = [u_x, u_y, u_z]
+    return u
+
+#switching function
+def switching_function_S(m, lambda_v, lambda_m):
+    norm_lambda_v = np.linalg.norm(lambda_v)
+    return (c / m) * norm_lambda_v + lambda_m - 1
+
+#throttle function
+def throttle_function_delta(S_val, rho_val):
+    return 0.5 * (1 + np.tanh(S_val / rho_val))
+
+#Hamiltonian function
+def hamiltonian(y, rho_val):
+    r_x, r_y, r_z, v_x, v_y, v_z, m, lambda_r_x, lambda_r_y, lambda_r_z, \
+    lambda_v_x, lambda_v_y, lambda_v_z, lambda_m = y
+    lambda_v = [lambda_v_x, lambda_v_y, lambda_v_z]
+    u = control_function_u(lambda_v)
+    S = switching_function_S(m, lambda_v, lambda_m)
+    delta = throttle_function_delta(S, rho_val)
+    #u_val_x, u_val_y, u_val_z = u(lambda_v_x, lambda_v_y, lambda_v_z)
+    term1 = lambda_r_x * v_x + lambda_r_y * v_y + lambda_r_z * v_z
+    term2 = lambda_v_x * (3 * n**2 * r_x + 2 * n * v_y)
+    term3 = lambda_v_y * (-2 * n * v_x)
+    term4 = lambda_v_z * (-n**2 * r_z)
+    term5 = (T / m) * delta * (lambda_v_x * u[0] + lambda_v_y * u[1] + lambda_v_z * u[2])
+    term6 = (T / c) * delta * (1 - lambda_m)
+    #term6 = -(T / c) * delta * (1 + lambda_m)
+    return term1 + term2 + term3 + term4 + term5 + term6
+
+# state and costate propagation function
+def propagate_states_and_costates(y, t, rho_val):
+    r_x, r_y, r_z, v_x, v_y, v_z, m, lambda_r_x, lambda_r_y, lambda_r_z, \
+    lambda_v_x, lambda_v_y, lambda_v_z, lambda_m = y
+    lambda_v = [lambda_v_x, lambda_v_y, lambda_v_z]
+    u = control_function_u(lambda_v)
+    S = switching_function_S(m, lambda_v, lambda_m)
+    delta = throttle_function_delta(S, rho_val)
+    # State dynamics
+    dr_x_dt = v_x
+    dr_y_dt = v_y
+    dr_z_dt = v_z
+    dv_x_dt = 3 * n**2 * r_x + 2 * n * v_y + (T / m) * delta * u[0]
+    dv_y_dt = -2 * n * v_x + (T / m) * delta * u[1]
+    dv_z_dt = -n**2 * r_z + (T / m) * delta * u[2]
+    dm_dt = -(T / c) * delta
+    # Costate dynamics
+    dlambda_r_x_dt = -3 * n**2 * lambda_v_x
+    dlambda_r_y_dt = 0
+    dlambda_r_z_dt = n**2 * lambda_v_z
+    dlambda_v_x_dt = -lambda_r_x + 2 * n * lambda_v_y
+    dlambda_v_y_dt = -lambda_r_y - 2 * n * lambda_v_x
+    dlambda_v_z_dt = -lambda_r_z
+    dlambda_m_dt = (T / m**2) * delta * np.dot(lambda_v, u)
+    return [dr_x_dt, dr_y_dt, dr_z_dt, dv_x_dt, dv_y_dt, dv_z_dt, dm_dt,
+            dlambda_r_x_dt, dlambda_r_y_dt, dlambda_r_z_dt, dlambda_v_x_dt,
+            dlambda_v_y_dt, dlambda_v_z_dt, dlambda_m_dt]
+
+#shooting function
+def shooting_function_24(X, rho_val):
+    """
+    X is a 24-element vector:
+    lambda_r0, lambda_v0, lambda_m0, lambda_r_wp, lambda_v_wp, lambda_m_wp, v_wp, m_wp, pie_wp, t_wp, t_seg1, t_seg2
+    
+    for all propagations
+    r_x, r_y, r_z, v_x, v_y, v_z, m, lambda_r_x, lambda_r_y, lambda_r_z, lambda_v_x, lambda_v_y, lambda_v_z, lambda_m     = y
+    """
+    #propagate first segment from initial point to waypoint
+    lambda_r0 = X[0:3]
+    lambda_v0 = X[3:6]
+    lambda_m = X[6]
+    y0_seg1 = r0 + v0 + [m0] + list(lambda_r0) + list(lambda_v0) + [lambda_m]
+    t1 = t0
+    t2 = X[22]
+    sol_seg1 = solve_ivp(lambda t, y:  propagate_states_and_costates(y, t, rho_val), t_span = (t1, t2), y0 = y0_seg1, method='RK45', rtol=1e-8, t_eval = np.linspace(t1, t2, 6000))
+    y_wp_minus = sol_seg1.y[:, -1]
+    res1 = list(y_wp_minus[0:3] - r_wp)                   #res1
+    v_wp = X[14:17]
+    res2 = list(y_wp_minus[3:6] - v_wp)                   #res2
+    m_wp = X[17]
+    res3 = y_wp_minus[6] - m_wp                           #res3
+    lambda_r_wp = X[7:10]
+    pie_wp = X[18:21]
+    res4 = list(y_wp_minus[7:10] - lambda_r_wp - pie_wp)   #res4
+    lambda_v_wp = X[10:13]
+    res5 = list(y_wp_minus[10:13] - lambda_v_wp)           #res5
+    lambda_m_wp = X[13]
+    res6 = y_wp_minus[-1] - lambda_m_wp                    #res6
+    ham_minus = hamiltonian(y_wp_minus, rho_val)
+    y_wp_plus = r_wp + list(v_wp) + [m_wp] + list(lambda_r_wp) + list(lambda_v_wp) + [lambda_m_wp]
+    ham_plus = hamiltonian(y_wp_plus, rho_val)
+    res7 = ham_plus - ham_minus                            #res7
+    
+    #propagate second segment from waypoint to final point
+    t1 = X[21]
+    t2 = t1 + X[23]
+    sol_seg2 = solve_ivp(lambda t, y:  propagate_states_and_costates(y, t, rho_val), t_span = (t1,t2), y0 = y_wp_plus, method='RK45', rtol=1e-8, t_eval = np.linspace(t1, t2, 6000))
+    y_tf = sol_seg2.y[:, -1]
+    res8 = list(y_tf[0:3] - rf )                     #res8
+    res9 = list(y_tf[3:6] - vf )                     #res9
+    res10 = y_tf[-1]                                 #res10
+    res11 = X[21] - X[22]                            #res11
+    res12 = tf - (X[21] + X[23])                     #res12
+
+    res_list = res1+res2+res4+res5+res8+res9+[res3, res6, res7, res10, res11, res12]
+    return res_list
+
+
+#Continuation function
+def loop_shoot_and_prop(X_guess, rho_val):
+    sol_X_guess = fsolve(lambda X: shooting_function_24(X, rho_val), X_guess, xtol=1e-12, maxfev=500)
+    err = np.linalg.norm(shooting_function_24(sol_X_guess, rho_val))    
+    lambda_r0 = sol_X_guess[0:3]
+    lambda_v0 = sol_X_guess[3:6]
+    lambda_m = sol_X_guess[6]
+    y0_seg1 = r0 + v0 + [m0] + list(lambda_r0) + list(lambda_v0) + [lambda_m]
+    t1 = t0
+    t2 = sol_X_guess[22]
+    sol_seg1 = solve_ivp(lambda t, y:  propagate_states_and_costates(y, t, rho_val), t_span = (t1, t2), y0 = y0_seg1, t_eval = np.linspace(t1, t2, 6000), method='RK45', rtol=1e-8 )
+    m_wp = sol_X_guess[17]
+    v_wp = sol_X_guess[14:17]
+    lambda_r_wp = sol_X_guess[7:10]
+    lambda_v_wp = sol_X_guess[10:13]
+    lambda_m_wp = sol_X_guess[13]
+    y_wp_plus = r_wp + list(v_wp) + [m_wp] + list(lambda_r_wp) + list(lambda_v_wp) + [lambda_m_wp]
+    t1 = sol_X_guess[21]
+    t2 = t1 + sol_X_guess[23]
+    sol_seg2 = solve_ivp(lambda t, y:  propagate_states_and_costates(y, t, rho_val), t_span = (t1,t2), y0 = y_wp_plus, t_eval = np.linspace(t1, t2, 6000), method='RK45', rtol=1e-8)
+
+    return sol_X_guess, sol_seg1, sol_seg2, err
+
+
+# Initial guesses for the 24 unknowns
+
+X_guess = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, m0, 0, 0, 0, tf/2, tf/2, tf/2]
+
+'''
+OPTIONS TESTED: 
+
+X_guess = [
+    6.7124e-5, 0.000232, -0.0002026, -0.841493, 1.08595, -0.65056, 2.3311e-6, 3.360e-5, 2.32e-4, 
+    2.03686e-4, -0.0515595, 3.60355e-7, 0.58836, 1.165588e-6, -2.03589e-12, -5.3350e-5, -1.023876e-13, 
+    49.99992, -6.7200e-5, 3.3462e-12, -4.07373e-4, 6000.002, 6000.002, 5999.998
+]
+
+X_guess = [
+    -0.066900796798, 0.231004163214, -0.201613544097, -838.452071307820,
+    1081.439429322429, -647.887507287825, 0.002323837994, 0.033518167403,
+    0.231000880548, 0.202631166744, -51.095600011692, 0.359138036593,
+    584.993956024960, 0.001162615549, -2.04e-9, -5.34e-5, -9.5e-10, 49.923882718223,
+    -0.067014822249, 0.000003282666, -0.405264620296, 5500.969607553113,
+    6001.969607553113, 5998.030392446886
+]
+
+X_guess = [0, 2e-4, -2e-4, -0.8, 1.1, -0.7, 0, 0, 0, 0, -0.05, 0, 0.5, 0, 0, 0, 0, 50, 0, 0, 0, 6000, 6000, 6000]
+
+X_guess = [0, 0, 0, -1, 1, -1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 50, 0, 0, 0, 6000, 6000, 6000]
+
+X_guess = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0, 6000, 6000, 6000]
+'''
+
+sol_seg1_list = []
+sol_seg2_list = []
+X_list = []
+rho_list = []
+err_list = []
+X_0 = X_guess
+rho_val_list = [0.9**i for i in range(int(-np.log2(1e-4)) + 1)]
+for rho_val in rho_val_list:
+    X_0_next, sol_seg1, sol_seg2, err = loop_shoot_and_prop(X_0, rho_val)
+    rho_list.append(rho_val)
+    sol_seg1_list.append(sol_seg1)
+    sol_seg2_list.append(sol_seg2)
+    X_list.append(X_0_next)
+    err_list.append(err)
+    X_0 = X_0_next
+
+
+# Extract the position and velocity and initial, way- and final points
+t1_final = X_0[-3]  # Optimal t_waypoint
+tf_final = t1_final + X_0[-1]  # Optimal final time
+
+# Extract r and v at t0
+r_t0 = sol_seg1_list[-1].y[0:3, 0]  # First three elements are r_x, r_y, r_z
+v_t0 = sol_seg1_list[-1].y[3:6, 0]  # Next three elements are v_x, v_y, v_z
+
+# Extract r and v at t_waypoint
+r_twp = sol_seg1_list[-1].y[0:3, -1]  # Last column at the end of segment 1
+v_twp = sol_seg1_list[-1].y[3:6, -1]
+
+# Extract r and v at t_f
+r_tf = sol_seg2_list[-1].y[0:3, -1]  # Last column at the end of segment 2
+v_tf = sol_seg2_list[-1].y[3:6, -1]
+
+# Print results with 2 decimal places
+print(f"at initial point time /sec = 0, \n r(t0) = {[f'{x:.4f}' for x in r_t0]}, v(t0) = {[f'{x:.4f}' for x in v_t0]} \n")
+print(f"at waypoint time /sec = {t1_final:.4f}, \n r(t_wp) = {[f'{x:.4f}' for x in r_twp]}, v(t_wp) = {[f'{x:.4f}' for x in v_twp]} \n")
+print(f"at final point time /sec = {tf_final:.4f}, \n r(tf) = {[f'{x:.4f}' for x in r_tf]}, v(tf) = {[f'{x:.4f}' for x in v_tf]} \n")
+
+# 3D plot of trajectory in relative frame
+
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+
+# Extract position components from the state vectors
+x1 = sol_seg1_list[-1].y[0]
+y1 = sol_seg1_list[-1].y[1]
+z1 = sol_seg1_list[-1].y[2]
+
+x2 = sol_seg2_list[-1].y[0]
+y2 = sol_seg2_list[-1].y[1]
+z2 = sol_seg2_list[-1].y[2]
+
+# Plot trajectory segments
+ax.plot3D(x1, y1, z1, 'b', label='Segment 1')
+ax.plot3D(x2, y2, z2, 'r', label='Segment 2')
+
+# Mark initial position
+ax.scatter(x1[0], y1[0], z1[0], color='green', s=60, label='Initial Position')
+
+# Mark waypoint position
+ax.scatter(x1[-1], y1[-1], z1[-1], color='orange', s=60, label='Waypoint', marker = '^')
+
+# Mark final position
+ax.scatter(x2[-1], y2[-1], z2[-1], color='red', s=60, label='Final Position')
+
+# Mark client vehicle position at origin
+ax.scatter(0, 0, 0, color='black', s=60, label='Client Vehicle', marker = '*')
+
+# Labels and view
+ax.set_xlabel('X', labelpad=15)  
+ax.set_ylabel('Y', labelpad=15) 
+ax.set_zlabel('Z', labelpad=15) 
+ax.set_title('Inspector Vehicle Trajectory in Relative Frame of Client Vehicle')
+ax.view_init(elev=20, azim=190)
+
+# Adjusting tick parameters
+ax.tick_params(axis='both', which='major', labelsize=10)  
+ax.tick_params(axis='x', which='major', pad=10) 
+ax.tick_params(axis='y', which='major', pad=10)
+ax.tick_params(axis='z', which='major', pad=10)
+
+# Move legend position on plot
+ax.legend(loc='center left', bbox_to_anchor=(-0.5, 0.5))
+# Adjust layout to prevent overlapping
+plt.tight_layout()
+plt.show()
+
+# Plot of states, cosates, controls, switching function, thrust profile 
+# For segment 1
+t1 = sol_seg1_list[-1].t  # Time for segment 1
+r1 = sol_seg1_list[-1].y[0:3, :]  # Position (r_x, r_y, r_z) for segment 1
+v1 = sol_seg1_list[-1].y[3:6, :]  # Velocity (v_x, v_y, v_z) for segment 1
+m1 = sol_seg1_list[-1].y[6, :]    # Mass for segment 1
+lambda_v1 = sol_seg1_list[-1].y[10:13, :]
+lambda_m1 = sol_seg1_list[-1].y[13, :]
+
+# For segment 2
+t2 = sol_seg2_list[-1].t  # Time for segment 2
+r2 = sol_seg2_list[-1].y[0:3, :]  # Position (r_x, r_y, r_z) for segment 2
+v2 = sol_seg2_list[-1].y[3:6, :]  # Velocity (v_x, v_y, v_z) for segment 2
+m2 = sol_seg2_list[-1].y[6, :]    # Mass for segment 2
+lambda_v2 = sol_seg2_list[-1].y[10:13, :]
+lambda_m2 = sol_seg2_list[-1].y[13, :]
+
+
+# Prepare arrays for control inputs, switching functions, and throttle for each segment
+u_x1, u_y1, u_z1, S1, throttle1 = [], [], [], [], []
+u_x2, u_y2, u_z2, S2, throttle2 = [], [], [], [], []
+
+# Segment 1 control inputs, switching functions, and throttle
+for i in range(len(t1)):
+    lambda_v1 = sol_seg1_list[-1].y[10:13, i]  # Extract lambda_v for segment 1
+    lambda_m1 = sol_seg1_list[-1].y[13, i]    # Extract lambda_m for segment 1
+    # Compute control input and switching function
+    u1 = control_function_u(lambda_v1)
+    u_x1.append(u1[0])
+    u_y1.append(u1[1])
+    u_z1.append(u1[2])
+    S_i = switching_function_S(m1[i], lambda_v1, lambda_m1)
+    if S_i>0:
+        delta_i = 1
+    else:
+        delta_i = 0
+    S1.append(S_i)
+    throttle1.append(delta_i)
+    
+# Segment 2 control inputs, switching functions, and throttle
+for i in range(len(t2)):
+    lambda_v2 = sol_seg2_list[-1].y[10:13, i]  # Extract lambda_v for segment 2
+    lambda_m2 = sol_seg2_list[-1].y[13, i]    # Extract lambda_m for segment 2
+    # Compute control input and switching function
+    u2 = control_function_u(lambda_v2)
+    u_x2.append(u2[0])
+    u_y2.append(u2[1])
+    u_z2.append(u2[2])
+    S_i = switching_function_S(m2[i], lambda_v2, lambda_m2)
+    if S_i>0:
+        delta_i = 1
+    else:
+        delta_i = 0
+    S2.append(S_i)
+    throttle2.append(delta_i)
+    
+# Plotting the results
+fig, axs = plt.subplots(5, 2, figsize=(15, 20))
+
+# Plot Position Trajectory (r_x, r_y, r_z)
+axs[0, 0].plot(t1, r1[0, :], label='rx_seg1')
+axs[0, 0].plot(t1, r1[1, :], label='ry_seg1')
+axs[0, 0].plot(t1, r1[2, :], label='rz_seg1')
+axs[0, 0].plot(t2, r2[0, :], label='rx_seg2', linestyle='--')
+axs[0, 0].plot(t2, r2[1, :], label='ry_seg2', linestyle='--')
+axs[0, 0].plot(t2, r2[2, :], label='rz_seg2', linestyle='--')
+axs[0, 0].set_title('Position Plot')
+axs[0, 0].set_xlabel('Time [s]')
+axs[0, 0].set_ylabel('Position [km]')
+axs[0, 0].legend()
+
+# Plot Velocity Trajectory (v_x, v_y, v_z)
+axs[0, 1].plot(t1, v1[0, :], label='vx_seg1')
+axs[0, 1].plot(t1, v1[1, :], label='vy_seg1')
+axs[0, 1].plot(t1, v1[2, :], label='vz_seg1')
+axs[0, 1].plot(t2, v2[0, :], label='vx_seg2', linestyle='--')
+axs[0, 1].plot(t2, v2[1, :], label='vy_seg2', linestyle='--')
+axs[0, 1].plot(t2, v2[2, :], label='vz_seg2', linestyle='--')
+axs[0, 1].set_title('Velocity Plot')
+axs[0, 1].set_xlabel('Time [s]')
+axs[0, 1].set_ylabel('Velocity [km/s]')
+axs[0, 1].legend()
+
+# Plot Mass Trajectory
+axs[1, 0].plot(t1, m1, label='m_seg1')
+axs[1, 0].plot(t2, m2, label='m_seg2', linestyle='--')
+axs[1, 0].set_yticks(np.linspace(min(m2), max(m1), 10)) 
+axs[1, 0].set_xlabel('Time [s]')
+axs[1, 0].set_ylabel('Mass [kg]')
+axs[1, 0].set_title('Mass Plot')
+axs[1, 0].legend()
+
+# Plot Position Costates (lambda_r_x, lambda_r_y, lambda_r_z)
+axs[1, 1].plot(t1, sol_seg1_list[-1].y[7, :], label='lam_rx_seg1')
+axs[1, 1].plot(t1, sol_seg1_list[-1].y[8, :], label='lam_ry_seg1')
+axs[1, 1].plot(t1, sol_seg1_list[-1].y[9, :], label='lam_rz_seg1')
+axs[1, 1].plot(t2, sol_seg2_list[-1].y[7, :], label='lam_rx_seg2', linestyle='--')
+axs[1, 1].plot(t2, sol_seg2_list[-1].y[8, :], label='lam_ry_seg2', linestyle='--')
+axs[1, 1].plot(t2, sol_seg2_list[-1].y[9, :], label='lam_rz_seg2', linestyle='--')
+axs[1, 1].set_title('Position Costate Plots')
+axs[1, 1].set_xlabel('Time [s]')
+axs[1, 1].set_ylabel('Position Costates')
+axs[1, 1].set_ylim(-0.001, 0.001)
+axs[1, 1].legend()
+
+#Plot Velocity Costates (lambda_v_x, lambda_v_y, lambda_v_z)
+axs[2, 0].plot(t1, sol_seg1_list[-1].y[10, :], label='lam_vx_seg1')
+axs[2, 0].plot(t2, sol_seg2_list[-1].y[10, :], label='lam_vx_seg2', linestyle='--')
+axs[2, 0].plot(t1, sol_seg1_list[-1].y[11, :], label='lam_vy_seg1')
+axs[2, 0].plot(t2, sol_seg2_list[-1].y[11, :], label='lam_vy_seg2', linestyle='--')
+axs[2, 0].plot(t1, sol_seg1_list[-1].y[12, :], label='lam_vz_seg1')
+axs[2, 0].plot(t2, sol_seg2_list[-1].y[12, :], label='lam_vz_seg2', linestyle='--')
+axs[2, 0].set_title('Velocity Costate Plots')
+axs[2, 0].set_xlabel('Time [s]')
+axs[2, 0].set_ylabel('Velocity Costates')
+axs[2, 0].legend()
+
+
+# Plot Mass Costates
+axs[2, 1].plot(t1, sol_seg1_list[-1].y[13, :], label='Segment 1')
+axs[2, 1].plot(t2, sol_seg2_list[-1].y[13, :], label='Segment 2', linestyle='--')
+axs[2, 1].set_title('Mass Costate Plot')
+axs[2, 1].set_xlabel('Time [s]')
+axs[2, 1].set_ylabel('Mass Costate')
+axs[2, 1].legend()
+
+# Plot Control Inputs (u_x, u_y, u_z)
+axs[3, 0].plot(t1, u_x1, label='ux_seg1')
+axs[3, 0].plot(t1, u_y1, label='uy_seg1')
+axs[3, 0].plot(t1, u_z1, label='uz_seg1')
+axs[3, 0].plot(t2, u_x2, label='ux_seg2', linestyle='--')
+axs[3, 0].plot(t2, u_y2, label='uy_seg2', linestyle='--')
+axs[3, 0].plot(t2, u_z2, label='uz_seg2', linestyle='--')
+axs[3, 0].set_title('Control Inputs Plots')
+axs[3, 0].set_xlabel('Time [s]')
+axs[3, 0].set_ylabel('Control Input')
+axs[3, 0].legend()
+
+# Plot Switching Function
+axs[3, 1].plot(t1, S1, label='S_seg1')
+axs[3, 1].plot(t2, S2, label='S_seg2', linestyle='--')
+axs[3, 1].set_title('Switching Function Plot')
+axs[3, 1].set_xlabel('Time [s]')
+axs[3, 1].set_ylabel('Switching Function S')
+axs[3, 1].legend()
+
+# Plot Thrust Profile (0 or T based on S)
+thrust1 = 1.5*np.array(throttle1)
+axs[4, 0].step(t1, thrust1, label='Thrust_seg1', linestyle='-')
+thrust2 = 1.5*np.array(throttle2)
+axs[4, 0].step(t2, thrust2, label='Thrust_seg2', linestyle='--')
+axs[4, 0].set_title('Thrust Plot')
+axs[4, 0].set_xlabel('Time [s]')
+axs[4, 0].set_ylabel('Thrust [mN]')
+axs[4, 0].legend()
+
+# Hide the empty subplot in the last row and column
+axs[4, 1].axis('off')
+
+plt.tight_layout()
+plt.show()
+
