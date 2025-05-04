@@ -150,7 +150,7 @@ def shooting_function_24(X, rho_val):
 
 #Continuation function
 def loop_shoot_and_prop(X_guess, rho_val):
-    sol_X_guess = fsolve(lambda X: shooting_function_24(X, rho_val), X_guess, xtol=1e-12, maxfev=500)
+    sol_X_guess = fsolve(lambda X: shooting_function_24(X, rho_val), X_guess, xtol=1e-12, maxfev=1000)
     err = np.linalg.norm(shooting_function_24(sol_X_guess, rho_val))    
     lambda_r0 = sol_X_guess[0:3]
     lambda_v0 = sol_X_guess[3:6]
@@ -207,7 +207,7 @@ X_list = []
 rho_list = []
 err_list = []
 X_0 = X_guess
-rho_val_list = [0.9**i for i in range(int(-np.log2(1e-4)) + 1)]
+rho_val_list = [0.9**i for i in range(70)]
 for rho_val in rho_val_list:
     X_0_next, sol_seg1, sol_seg2, err = loop_shoot_and_prop(X_0, rho_val)
     rho_list.append(rho_val)
